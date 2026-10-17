@@ -1,0 +1,2 @@
+My MCP assistant can read files.
+It can also remember conversations using SQLite.
