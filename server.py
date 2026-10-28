@@ -1,167 +1,267 @@
 import sqlite3
-from datetime import date
+import math
+from contextlib import contextmanager
+from datetime import date, datetime
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from config import DATABASE_PATH, MAX_AMOUNT, MAX_CATEGORY_LENGTH, MAX_DESCRIPTION_LENGTH, MAX_LIST_LIMIT, ALLOWED_TOOLS
+from validators import (
+    validate_amount,
+    validate_category,
+    validate_description,
+    validate_expense_date,
+    validate_expense_id,
+    validate_year_month,
+    validate_limit,
+    ValidationError,
+)
+from database import get_connection, initialize_database
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
 mcp = FastMCP("Smart Expense Tracker")
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = BASE_DIR / "expenses.db"
+
+# =========================================================
+# DATABASE INITIALIZATION
+# =========================================================
+
+try:
+    initialize_database()
+except sqlite3.Error as error:
+    raise RuntimeError(f"Database initialization failed: {error}") from error
 
 
-def get_connection():
-    """Open a connection to the local SQLite database."""
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def initialize_database():
-    """Create the expenses table if it does not exist."""
-    with get_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                amount REAL NOT NULL CHECK(amount > 0),
-                category TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                expense_date TEXT NOT NULL
-            )
-            """
-        )
-
+# =========================================================
+# EXPENSE FORMATTING
+# =========================================================
 
 def format_expense(row):
+    """
+    Format an expense for the existing Streamlit app.
+    Keep compatible format.
+    """
     return (
-        f"ID {row['id']} | ₹{row['amount']:.2f} | "
-        f"{row['category']} | {row['description'] or ''} | "
+        f"ID {row['id']} | "
+        f"₹{row['amount']:.2f} | "
+        f"{row['category']} | "
+        f"{row['description'] or ''} | "
         f"{row['expense_date']}"
     )
 
 
-initialize_database()
-
+# =========================================================
+# ADD EXPENSE
+# =========================================================
 
 @mcp.tool()
-def add_expense(amount: float, category: str, description: str = "",
-                expense_date: str = "") -> str:
-    """Record an expense."""
-    if amount <= 0:
-        return "Error: Amount must be greater than zero."
-    category = category.strip().title()
-    if not category:
-        return "Error: Category cannot be empty."
-    expense_date = expense_date.strip() or date.today().isoformat()
+def add_expense(amount: float, category: str, description: str = "", expense_date: str = "") -> str:
     try:
-        date.fromisoformat(expense_date)
-    except ValueError:
-        return "Error: Date must use YYYY-MM-DD format."
+        amount = validate_amount(amount)
+        category = validate_category(category)
+        description = validate_description(description)
 
-    with get_connection() as conn:
-        cursor = conn.execute(
-            """INSERT INTO expenses (amount, category, description, expense_date)
-               VALUES (?, ?, ?, ?)""",
-            (amount, category, description.strip(), expense_date),
-        )
-        expense_id = cursor.lastrowid
-    return f"Expense added successfully. ID: {expense_id}"
+        if isinstance(expense_date, str):
+            expense_date_clean = expense_date.strip()
+        else:
+            expense_date_clean = expense_date
 
+        if not expense_date_clean:
+            expense_date_clean = date.today().isoformat()
+
+        expense_date_clean = validate_expense_date(expense_date_clean)
+
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO expenses (amount, category, description, expense_date)
+                VALUES (?, ?, ?, ?)
+                """,
+                (amount, category, description, expense_date_clean),
+            )
+            expense_id = cursor.lastrowid
+
+        return f"Expense added successfully. ID: {expense_id}"
+    except ValidationError as error:
+        return f"Error: {error}"
+    except ValueError as error:
+        return f"Error: {error}"
+    except sqlite3.Error:
+        return "Error: Unable to save expense to the database."
+
+
+# =========================================================
+# LIST EXPENSES
+# =========================================================
 
 @mcp.tool()
 def list_expenses(limit: int = 5) -> str:
-    """List latest five expenses by default. Use limit=0 to list all."""
-    if limit < 0:
-        return "Error: Limit cannot be negative."
-    with get_connection() as conn:
-        query = """SELECT id, amount, category, description, expense_date
-                   FROM expenses ORDER BY id DESC"""
-        rows = conn.execute(query if limit == 0 else query + " LIMIT ?",
-                            () if limit == 0 else (limit,)).fetchall()
-    if not rows:
-        return "No expenses have been recorded yet."
-    return "\n".join(format_expense(row) for row in rows)
+    try:
+        limit = validate_limit(limit)
+        query = """
+            SELECT id, amount, category, description, expense_date
+            FROM expenses
+            ORDER BY id DESC
+        """
+        with get_connection() as conn:
+            if limit == 0:
+                rows = conn.execute(query).fetchall()
+            else:
+                rows = conn.execute(query + " LIMIT ?", (limit,)).fetchall()
 
+        if not rows:
+            return "No expenses have been recorded yet."
+        return "\n".join(format_expense(row) for row in rows)
+    except ValidationError as error:
+        return f"Error: {error}"
+    except ValueError as error:
+        return f"Error: {error}"
+    except sqlite3.Error:
+        return "Error: Unable to retrieve expenses from the database."
+
+
+# =========================================================
+# GET EXPENSE
+# =========================================================
 
 @mcp.tool()
 def get_expense(expense_id: int) -> dict:
-    """Get one expense by ID, for editing."""
-    with get_connection() as conn:
-        row = conn.execute(
-            """SELECT id, amount, category, description, expense_date
-               FROM expenses WHERE id = ?""", (expense_id,)
-        ).fetchone()
-    if row is None:
-        return {"error": f"Expense ID {expense_id} was not found."}
-    return dict(row)
+    try:
+        expense_id = validate_expense_id(expense_id)
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, amount, category, description, expense_date
+                FROM expenses
+                WHERE id = ?
+                """,
+                (expense_id,),
+            ).fetchone()
+        if row is None:
+            return {"error": f"Expense ID {expense_id} was not found."}
+        return dict(row)
+    except ValidationError as error:
+        return {"error": str(error)}
+    except ValueError as error:
+        return {"error": str(error)}
+    except sqlite3.Error:
+        return {"error": "Unable to retrieve expense from the database."}
 
+
+# =========================================================
+# UPDATE EXPENSE
+# =========================================================
 
 @mcp.tool()
-def update_expense(expense_id: int, amount: float, category: str,
-                   description: str, expense_date: str) -> str:
-    """Update an existing expense."""
-    if amount <= 0:
-        return "Error: Amount must be greater than zero."
-    category = category.strip().title()
-    if not category:
-        return "Error: Category cannot be empty."
+def update_expense(expense_id: int, amount: float, category: str, description: str, expense_date: str) -> str:
     try:
-        date.fromisoformat(expense_date)
-    except ValueError:
-        return "Error: Date must use YYYY-MM-DD format."
+        expense_id = validate_expense_id(expense_id)
+        amount = validate_amount(amount)
+        category = validate_category(category)
+        description = validate_description(description)
+        expense_date = validate_expense_date(expense_date)
 
-    with get_connection() as conn:
-        cursor = conn.execute(
-            """UPDATE expenses
-               SET amount = ?, category = ?, description = ?, expense_date = ?
-               WHERE id = ?""",
-            (amount, category, description.strip(), expense_date, expense_id),
-        )
-    if cursor.rowcount == 0:
-        return f"Error: Expense ID {expense_id} was not found."
-    return f"Expense ID {expense_id} updated successfully."
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE expenses
+                SET amount = ?, category = ?, description = ?, expense_date = ?
+                WHERE id = ?
+                """,
+                (amount, category, description, expense_date, expense_id),
+            )
+            if cursor.rowcount == 0:
+                return f"Error: Expense ID {expense_id} was not found."
+        return f"Expense ID {expense_id} updated successfully."
+    except ValidationError as error:
+        return f"Error: {error}"
+    except ValueError as error:
+        return f"Error: {error}"
+    except sqlite3.Error:
+        return "Error: Unable to update expense in the database."
 
+
+# =========================================================
+# DELETE EXPENSE
+# =========================================================
 
 @mcp.tool()
 def delete_expense(expense_id: int) -> str:
-    """Delete an expense by ID."""
-    with get_connection() as conn:
-        cursor = conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
-    if cursor.rowcount == 0:
-        return f"Error: Expense ID {expense_id} was not found."
-    return f"Expense ID {expense_id} deleted successfully."
+    try:
+        expense_id = validate_expense_id(expense_id)
+        with get_connection() as conn:
+            cursor = conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+            if cursor.rowcount == 0:
+                return f"Error: Expense ID {expense_id} was not found."
+        return f"Expense ID {expense_id} deleted successfully."
+    except ValidationError as error:
+        return f"Error: {error}"
+    except ValueError as error:
+        return f"Error: {error}"
+    except sqlite3.Error:
+        return "Error: Unable to delete expense from the database."
 
+
+# =========================================================
+# MONTHLY TOTAL
+# =========================================================
 
 @mcp.tool()
 def monthly_total(year: int, month: int) -> str:
-    """Calculate total spending for a selected month."""
-    if not 1 <= month <= 12:
-        return "Error: Month must be from 1 to 12."
-    month_prefix = f"{year:04d}-{month:02d}"
-    with get_connection() as conn:
-        row = conn.execute(
-            """SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
-               WHERE substr(expense_date, 1, 7) = ?""", (month_prefix,)
-        ).fetchone()
-    return f"Total expenses for {month_prefix}: ₹{row['total']:.2f}"
+    try:
+        month_prefix = validate_year_month(year, month)
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE substr(expense_date, 1, 7) = ?",
+                (month_prefix,),
+            ).fetchone()
+        total = round(float(row["total"]), 2)
+        return f"Total expenses for {month_prefix}: ₹{total:.2f}"
+    except ValidationError as error:
+        return f"Error: {error}"
+    except ValueError as error:
+        return f"Error: {error}"
+    except sqlite3.Error:
+        return "Error: Unable to calculate monthly expenses."
 
+
+# =========================================================
+# TOP CATEGORIES
+# =========================================================
 
 @mcp.tool()
 def top_categories(year: int, month: int) -> str:
-    """Return totals grouped by category for a month."""
-    if not 1 <= month <= 12:
-        return "Error: Month must be from 1 to 12."
-    month_prefix = f"{year:04d}-{month:02d}"
-    with get_connection() as conn:
-        rows = conn.execute(
-            """SELECT category, SUM(amount) AS total FROM expenses
-               WHERE substr(expense_date, 1, 7) = ?
-               GROUP BY category ORDER BY total DESC""", (month_prefix,)
-        ).fetchall()
-    if not rows:
-        return "No expenses found for this month."
-    return "\n".join(f"{row['category']}: ₹{row['total']:.2f}" for row in rows)
+    try:
+        month_prefix = validate_year_month(year, month)
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT category, SUM(amount) AS total
+                FROM expenses
+                WHERE substr(expense_date, 1, 7) = ?
+                GROUP BY category
+                ORDER BY total DESC
+                """,
+                (month_prefix,),
+            ).fetchall()
+        if not rows:
+            return "No expenses found for this month."
+        results = []
+        for row in rows:
+            total = round(float(row["total"]), 2)
+            results.append(f"{row['category']}: ₹{total:.2f}")
+        return "\n".join(results)
+    except ValidationError as error:
+        return f"Error: {error}"
+    except ValueError as error:
+        return f"Error: {error}"
+    except sqlite3.Error:
+        return "Error: Unable to retrieve monthly category totals."
 
 
 if __name__ == "__main__":
